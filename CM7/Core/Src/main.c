@@ -58,9 +58,9 @@ COM_InitTypeDef BspCOMInit;
 SD_HandleTypeDef hsd1;
 
 /* USER CODE BEGIN PV */
+
 #define BUFFER_SIZE_BYTES     (32 * 1024)
 #define RECORD_SIZE_BYTES     64
-#define RECORD_COUNT          (BUFFER_SIZE_BYTES / RECORD_SIZE_BYTES)
 
 #define SD_BLOCK_SIZE         512
 #define SD_BLOCK_COUNT        (BUFFER_SIZE_BYTES / SD_BLOCK_SIZE)
@@ -70,9 +70,36 @@ SD_HandleTypeDef hsd1;
 volatile uint8_t sd_dma_tx_done = 0;
 volatile uint8_t sd_dma_tx_error = 0;
 
+uint32_t global_record_id = 0; // 『 每一筆 』 資料索引  每一筆資料的「全球唯一流水號」
+uint32_t current_file_id = 0; // 這筆資料屬於哪個 64MB 檔案 例如： file 0   file 1  file 2 ....  例如： 假設：  file_id = 5   代表：   這筆資料： 屬於：  第5個 64MB segment  之後 packaging： 你只要掃： file_id == 5 就能做成：  LOG0005.TXT
+
+uint32_t current_chunk_count = 0;// 計算目前累積了多少個 32KB chunk   你現在： 每次 DMA：  寫入 32KB    而：  64MB   需要：  2048 次 32KB   所以：   current_chunk_count++;   代表：  目前已經寫了幾個chunk   當：  current_chunk_count >= 2048  代表： 一個64MB segment完成   然後： current_file_id++;     開始下一個檔案。
+
+#define CHUNKS_PER_FILE   2048
+
+#define RECORD_TAIL_MARKER   0xAA55
+
+typedef struct
+{
+    uint8_t payload[54];
+
+    uint16_t tail;
+
+    uint32_t record_id;
+
+    uint32_t file_id;
+
+} log_record_t;
+
+#define RECORD_COUNT   (BUFFER_SIZE_BYTES / sizeof(log_record_t))
+
+uint32_t current_sector = START_SECTOR;
+
 __attribute__((section(".RAM_D1")))
 __attribute__((aligned(32)))
-uint8_t sd_buffer[BUFFER_SIZE_BYTES];
+log_record_t sd_buffer[RECORD_COUNT];
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,22 +113,36 @@ static void MX_SDMMC1_SD_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 void FillBuffer(void)
 {
     uint32_t i;
-    uint32_t offset;
+    uint32_t j;
+
+    log_record_t *record;
 
     for(i = 0; i < RECORD_COUNT; i++)
     {
-        offset = i * RECORD_SIZE_BYTES;
+        record = &sd_buffer[i];
 
-        memcpy(&sd_buffer[offset],
-               "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890abcdefghijklmnop\r\n",
-               54);
+        for(j = 0; j < 52; j++)
+        {
+            record->payload[j] =
+                (uint8_t)('A' + (j % 26));
+        }
 
-        memset(&sd_buffer[offset + 54], 0xAA, 10);
+        record->payload[52] = '\r';
+        record->payload[53] = '\n';
+
+        record->tail = 0xAA55;
+
+        record->record_id = global_record_id++;
+
+        record->file_id = current_file_id;
     }
 }
+
+
 /* USER CODE END 0 */
 
 /**
@@ -181,7 +222,10 @@ Error_Handler();
   MX_GPIO_Init();
   MX_SDMMC1_SD_Init();
   /* USER CODE BEGIN 2 */
-  FillBuffer();
+    
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -209,18 +253,21 @@ Error_Handler();
   while (1)
   {
       uint32_t loop;
-      uint32_t sector = START_SECTOR;
 
       for(loop = 0; loop < 1000; loop++)
       {
+          FillBuffer(); 
+
+          SCB_CleanDCache_by_Addr((uint32_t*)sd_buffer, BUFFER_SIZE_BYTES);
+
           sd_dma_tx_done = 0;
           sd_dma_tx_error = 0;
 
-          //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);//寫入到SD卡前拉高電位
+          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);//寫入到SD卡前拉高電位
 
           if(HAL_SD_WriteBlocks_DMA(&hsd1,
-                                    sd_buffer,
-                                    sector,
+                                     (uint8_t*)sd_buffer,
+                                    current_sector,
                                     SD_BLOCK_COUNT) != HAL_OK)
           {
               Error_Handler();
@@ -229,19 +276,27 @@ Error_Handler();
           while((sd_dma_tx_done == 0) && (sd_dma_tx_error == 0))
           {
             /* DMA背景寫入期間 CM7持續做別的工作 本行用於證明這是非阻塞式 工作模式，當 HAL_SD_WriteBlocks_DMA 執行後， CM7 控制權可以去做其他事情，不必等待 SD 卡寫完 */
-            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
+            //HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
           }
 
-          //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);// 完成SD卡寫入，電位拉低
+          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);// 完成SD卡寫入，電位拉低
 
           if(sd_dma_tx_error)
           {
               Error_Handler();
           }
 
-          sector += SD_BLOCK_COUNT;
+          current_sector += SD_BLOCK_COUNT;
 
-          HAL_Delay(10);
+          current_chunk_count++;
+
+          if(current_chunk_count >= CHUNKS_PER_FILE)
+          {
+              current_chunk_count = 0;
+              current_file_id++;
+          }
+
+          HAL_Delay(10);//方便波形觀測
       }
 
       while(1)
