@@ -216,7 +216,7 @@ Error_Handler();
           sd_dma_tx_done = 0;
           sd_dma_tx_error = 0;
 
-          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);
+          //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_SET);//寫入到SD卡前拉高電位
 
           if(HAL_SD_WriteBlocks_DMA(&hsd1,
                                     sd_buffer,
@@ -228,9 +228,11 @@ Error_Handler();
 
           while((sd_dma_tx_done == 0) && (sd_dma_tx_error == 0))
           {
+            /* DMA背景寫入期間 CM7持續做別的工作 本行用於證明這是非阻塞式 工作模式，當 HAL_SD_WriteBlocks_DMA 執行後， CM7 控制權可以去做其他事情，不必等待 SD 卡寫完 */
+            HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
           }
 
-          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);
+          //HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);// 完成SD卡寫入，電位拉低
 
           if(sd_dma_tx_error)
           {
