@@ -97,8 +97,11 @@ uint32_t current_sector = START_SECTOR;
 
 __attribute__((section(".RAM_D1")))
 __attribute__((aligned(32)))
-log_record_t sd_buffer[RECORD_COUNT];
+log_record_t sd_buffer[RECORD_COUNT]; // 寫入 SD 卡 的 buffer
 
+__attribute__((section(".RAM_D1")))
+__attribute__((aligned(32)))
+log_record_t read_buffer[RECORD_COUNT]; // 讀出 SD 卡 的 buffer
 
 /* USER CODE END PV */
 
@@ -114,6 +117,7 @@ static void MX_SDMMC1_SD_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// 模擬方式填滿 64 byte 資料
 void FillBuffer(void)
 {
     uint32_t i;
@@ -142,6 +146,49 @@ void FillBuffer(void)
     }
 }
 
+// 計算 SD 卡內有機個 64M Byte 
+uint32_t CountSegments(uint32_t expected_segments)
+{
+    uint32_t segment_count = 0;
+
+    uint32_t segment;
+
+    uint32_t sector;
+
+    for(segment = 0;
+        segment < expected_segments;
+        segment++)
+    {
+        sector =
+            START_SECTOR +
+            (segment * CHUNKS_PER_FILE * SD_BLOCK_COUNT);
+
+        if(HAL_SD_ReadBlocks(&hsd1,
+                             (uint8_t*)read_buffer,
+                             sector,
+                             SD_BLOCK_COUNT,
+                             HAL_MAX_DELAY) != HAL_OK)
+        {
+            break;
+        }
+
+        SCB_InvalidateDCache_by_Addr(
+            (uint32_t*)read_buffer,
+            BUFFER_SIZE_BYTES
+        );
+
+        /* 只檢查 tail marker */
+
+        if(read_buffer[0].tail != 0xAA55)
+        {
+            break;
+        }
+
+        segment_count++;
+    }
+
+    return segment_count;
+}
 
 /* USER CODE END 0 */
 
@@ -250,13 +297,26 @@ Error_Handler();
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
+  /*
+  2048 loops = 1 個 64MB segment 
+  4096 loops = 2 個 64MB segment 
+  6144 loops = 3 個 64MB segment 
+  8192 loops = 4 個 64MB segment 
+  10240 loops = 5 個 64MB segment 
+
+  16384 loops = 8 個 64MB segment 
+  */
+
   while (1)
   {
-      uint32_t loop;
+      uint64_t loop;
+      uint64_t max_loop = 16384; // 驗證過，確實會產生 8 個 Pulse 2026-05-28 
+      uint32_t segmentation = max_loop / 2048;
 
-      for(loop = 0; loop < 1000; loop++)
+      for(loop = 0; loop < max_loop; loop++)  //可形成 4 個 64MB segmentation
       {
           FillBuffer(); 
+          //memset(sd_buffer, 0x55, BUFFER_SIZE_BYTES);//驗證 FillBuffer(); 是否有問題之用
 
           SCB_CleanDCache_by_Addr((uint32_t*)sd_buffer, BUFFER_SIZE_BYTES);
 
@@ -279,6 +339,11 @@ Error_Handler();
             //HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_6);
           }
 
+          // ★ 等 SD card internal write 完成（關鍵）
+          while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER)
+          {
+          }
+
           HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6, GPIO_PIN_RESET);// 完成SD卡寫入，電位拉低
 
           if(sd_dma_tx_error)
@@ -296,11 +361,36 @@ Error_Handler();
               current_file_id++;
           }
 
-          HAL_Delay(10);//方便波形觀測
+          //HAL_Delay(10);//不需要透過這種固定式延遲，由 while (HAL_SD_GetCardState(&hsd1) != HAL_SD_CARD_TRANSFER) 來判斷是否寫入完成
       }
+
+
+      // 上面是寫入資料到 SD 卡，以 Raw data 方式，這裡是讀出 SD 卡資料。
+      // 每讀出一個 64M Byte 單位，就顯示一個脈波高電位
+      uint32_t segment_count;
+
+      segment_count = CountSegments(segmentation);
 
       while(1)
       {
+          uint32_t i;
+
+          for(i = 0; i < segment_count; i++)
+          {
+              HAL_GPIO_WritePin(GPIOA,
+                                GPIO_PIN_6,
+                                GPIO_PIN_SET);
+
+              HAL_Delay(1);
+
+              HAL_GPIO_WritePin(GPIOA,
+                                GPIO_PIN_6,
+                                GPIO_PIN_RESET);
+
+              HAL_Delay(1);
+          }
+
+          HAL_Delay(10);
       }
 
     /* USER CODE END WHILE */
@@ -476,7 +566,7 @@ void MPU_Config(void)
   MPU_InitStruct.Enable = MPU_REGION_ENABLE;
   MPU_InitStruct.Number = MPU_REGION_NUMBER0;
   MPU_InitStruct.BaseAddress = 0x24000000;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_32KB;
+  MPU_InitStruct.Size = MPU_REGION_SIZE_64KB; // 兼具寫與讀情況下，這裡要修改
   MPU_InitStruct.SubRegionDisable = 0x0;
   MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
   MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
